@@ -1,0 +1,15 @@
+.env
+
+*.session
+*.session-journal
+
+*.db
+
+__pycache__/
+*.pyc
+
+test_session.py
+test_updates.py
+
+start_bot.bat
+start_monitor.bat

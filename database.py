@@ -1,0 +1,485 @@
+import sqlite3
+import re
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+DB_FILE = Path("keyword_bot.db")
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def parse_dt(value):
+    return datetime.fromisoformat(value)
+
+
+def connect():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _add_column_if_missing(conn, table, column, definition):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def init_db():
+    with connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                access_expires_at TEXT,
+                monitoring_enabled INTEGER NOT NULL DEFAULT 1,
+                paused_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                keyword TEXT NOT NULL,
+                UNIQUE(user_id, keyword),
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS access_codes (
+                code TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL DEFAULT 86400,
+                activated_by INTEGER,
+                activated_at TEXT,
+                expires_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS monitored_chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                username TEXT,
+                chat_type TEXT,
+                last_seen_at TEXT NOT NULL,
+                admin_monitored INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        # Optional extra sources that an individual customer can add.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_monitored_chats (
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, chat_id),
+                FOREIGN KEY(user_id) REFERENCES users(user_id),
+                FOREIGN KEY(chat_id) REFERENCES monitored_chats(chat_id)
+            )
+        """)
+
+        # Migrate databases created by earlier versions.
+        _add_column_if_missing(conn, "users", "monitoring_enabled", "INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(conn, "monitored_chats", "admin_monitored", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "users", "paused_at", "TEXT")
+        _add_column_if_missing(conn, "access_codes", "duration_seconds", "INTEGER NOT NULL DEFAULT 86400")
+        _add_column_if_missing(conn, "access_codes", "activated_by", "INTEGER")
+        _add_column_if_missing(conn, "access_codes", "activated_at", "TEXT")
+        _add_column_if_missing(conn, "access_codes", "expires_at", "TEXT")
+        conn.execute("UPDATE users SET monitoring_enabled=1 WHERE monitoring_enabled IS NULL")
+        conn.commit()
+
+
+def ensure_user(user_id):
+    with connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users(user_id, monitoring_enabled) VALUES (?, 1)",
+            (int(user_id),),
+        )
+        conn.commit()
+
+
+def get_user_expiry(user_id):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT access_expires_at FROM users WHERE user_id=?",
+            (int(user_id),),
+        ).fetchone()
+    if not row or not row["access_expires_at"]:
+        return None
+    return parse_dt(row["access_expires_at"])
+
+
+def has_active_access(user_id):
+    expiry = get_user_expiry(user_id)
+    return expiry is not None and expiry > now_utc()
+
+
+def set_user_access(user_id, expires_at):
+    ensure_user(user_id)
+    with connect() as conn:
+        conn.execute(
+            "UPDATE users SET access_expires_at=?, monitoring_enabled=1, paused_at=NULL WHERE user_id=?",
+            (iso(expires_at), int(user_id)),
+        )
+        conn.commit()
+
+
+def is_monitoring_enabled(user_id):
+    ensure_user(user_id)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT monitoring_enabled FROM users WHERE user_id=?",
+            (int(user_id),),
+        ).fetchone()
+    return bool(row and row["monitoring_enabled"])
+
+
+def pause_monitoring(user_id):
+    ensure_user(user_id)
+    now = now_utc()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT access_expires_at, monitoring_enabled, paused_at FROM users WHERE user_id=?",
+            (int(user_id),),
+        ).fetchone()
+        if not row or not row["access_expires_at"]:
+            return False, "no_access"
+        expiry = parse_dt(row["access_expires_at"])
+        if expiry <= now:
+            return False, "expired"
+        if not bool(row["monitoring_enabled"]):
+            return False, "already_paused"
+        conn.execute(
+            "UPDATE users SET monitoring_enabled=0, paused_at=? WHERE user_id=?",
+            (iso(now), int(user_id)),
+        )
+        conn.commit()
+    return True, "ok"
+
+
+def resume_monitoring(user_id):
+    ensure_user(user_id)
+    now = now_utc()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT access_expires_at, monitoring_enabled, paused_at FROM users WHERE user_id=?",
+            (int(user_id),),
+        ).fetchone()
+        if not row or not row["access_expires_at"]:
+            return False, "no_access", None
+        expiry = parse_dt(row["access_expires_at"])
+        if bool(row["monitoring_enabled"]):
+            return False, "already_running", expiry
+        paused_at = parse_dt(row["paused_at"]) if row["paused_at"] else None
+        if not paused_at:
+            return False, "not_paused", expiry
+        # Preserve the remaining access time by extending the original expiry
+        # by exactly the amount of time spent paused.
+        new_expiry = expiry + (now - paused_at)
+        conn.execute(
+            "UPDATE users SET access_expires_at=?, monitoring_enabled=1, paused_at=NULL WHERE user_id=?",
+            (iso(new_expiry), int(user_id)),
+        )
+        conn.commit()
+    return True, "ok", new_expiry
+
+
+def add_keyword(user_id, keyword):
+    ensure_user(user_id)
+    keyword = keyword.strip()
+    if not keyword:
+        return False
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO keywords(user_id, keyword) VALUES (?, ?)",
+            (int(user_id), keyword),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def remove_keyword(user_id, keyword):
+    keyword = keyword.strip()
+    if not keyword:
+        return False
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM keywords WHERE user_id=? AND LOWER(keyword)=LOWER(?)",
+            (int(user_id), keyword),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_keywords(user_id):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT keyword FROM keywords WHERE user_id=? ORDER BY id",
+            (int(user_id),),
+        ).fetchall()
+    return [row["keyword"] for row in rows]
+
+
+def get_all_active_keyword_users():
+    now = iso(now_utc())
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT u.user_id, k.keyword
+            FROM users u
+            JOIN keywords k ON k.user_id = u.user_id
+            WHERE u.access_expires_at IS NOT NULL
+              AND u.access_expires_at > ?
+              AND u.monitoring_enabled = 1
+            ORDER BY u.user_id, k.id
+        """, (now,)).fetchall()
+
+    result = {}
+    for row in rows:
+        result.setdefault(int(row["user_id"]), []).append(row["keyword"])
+    return result
+
+
+def create_access_code(code, created_at, duration_seconds):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO access_codes(code, created_at, duration_seconds) VALUES (?, ?, ?)",
+            (code, iso(created_at), int(duration_seconds)),
+        )
+        conn.commit()
+
+
+def activate_access_code(code, user_id, activated_at):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT code, duration_seconds, activated_by, expires_at FROM access_codes WHERE code=?",
+            (code,),
+        ).fetchone()
+        if not row:
+            return False, "invalid", None
+        if row["activated_by"] is not None:
+            return False, "used", None
+
+        expires_at = activated_at + timedelta(seconds=int(row["duration_seconds"]))
+        cur = conn.execute("""
+            UPDATE access_codes
+            SET activated_by=?, activated_at=?, expires_at=?
+            WHERE code=? AND activated_by IS NULL
+        """, (int(user_id), iso(activated_at), iso(expires_at), code))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "used", None
+        conn.commit()
+
+    set_user_access(user_id, expires_at)
+    return True, "ok", expires_at
+
+
+def get_access_codes():
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT code, created_at, duration_seconds, activated_by, activated_at, expires_at
+            FROM access_codes
+            ORDER BY created_at DESC
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_customers():
+    now = now_utc()
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT
+                u.user_id,
+                u.access_expires_at,
+                u.monitoring_enabled,
+                u.paused_at,
+                COUNT(k.id) AS keyword_count,
+                MAX(ac.activated_at) AS last_activated_at
+            FROM users u
+            LEFT JOIN keywords k ON k.user_id = u.user_id
+            LEFT JOIN access_codes ac ON ac.activated_by = u.user_id
+            GROUP BY u.user_id
+            ORDER BY
+                CASE WHEN u.access_expires_at IS NOT NULL AND u.access_expires_at > ? THEN 0 ELSE 1 END,
+                u.access_expires_at DESC,
+                u.user_id
+        """, (iso(now),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_monitored_chat(chat_id, title, username=None, chat_type=None):
+    with connect() as conn:
+        conn.execute("""
+            INSERT INTO monitored_chats(
+                chat_id, title, username, chat_type, last_seen_at, admin_monitored
+            )
+            VALUES (?, ?, ?, ?, ?, 0)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title,
+                username=excluded.username,
+                chat_type=excluded.chat_type,
+                last_seen_at=excluded.last_seen_at
+        """, (
+            int(chat_id),
+            title or "Unknown",
+            username,
+            chat_type,
+            iso(now_utc()),
+        ))
+        conn.commit()
+
+
+def get_monitored_chats():
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT chat_id, title, username, chat_type, last_seen_at, admin_monitored
+            FROM monitored_chats
+            ORDER BY chat_type, title COLLATE NOCASE
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_monitored_chat(value):
+    """Find a source recorded from the monitoring Telegram account."""
+    value = str(value).strip()
+    if not value:
+        return None
+
+    with connect() as conn:
+        row = None
+
+        if re.fullmatch(r"-?\d+", value):
+            row = conn.execute(
+                "SELECT chat_id, title, username, chat_type, last_seen_at, admin_monitored "
+                "FROM monitored_chats WHERE chat_id=?",
+                (int(value),),
+            ).fetchone()
+
+        if row is None:
+            username = value.lstrip("@").lower()
+            row = conn.execute(
+                "SELECT chat_id, title, username, chat_type, last_seen_at, admin_monitored "
+                "FROM monitored_chats "
+                "WHERE LOWER(COALESCE(username, ''))=?",
+                (username,),
+            ).fetchone()
+
+        if row is None:
+            row = conn.execute(
+                "SELECT chat_id, title, username, chat_type, last_seen_at, admin_monitored "
+                "FROM monitored_chats WHERE LOWER(title)=LOWER(?) "
+                "ORDER BY last_seen_at DESC LIMIT 1",
+                (value,),
+            ).fetchone()
+
+    return dict(row) if row else None
+
+
+def set_admin_monitored_chat(chat_id, enabled=True):
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE monitored_chats SET admin_monitored=? WHERE chat_id=?",
+            (1 if enabled else 0, int(chat_id)),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def get_admin_monitored_chats():
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT chat_id, title, username, chat_type, last_seen_at, admin_monitored
+            FROM monitored_chats
+            WHERE admin_monitored=1
+            ORDER BY chat_type, title COLLATE NOCASE
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_admin_monitored_chat_ids():
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM monitored_chats WHERE admin_monitored=1"
+        ).fetchall()
+    return {int(row["chat_id"]) for row in rows}
+
+
+def add_user_monitored_chat(user_id, chat_id):
+    ensure_user(user_id)
+    with connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM monitored_chats WHERE chat_id=?",
+            (int(chat_id),),
+        ).fetchone()
+        if not exists:
+            return False
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO user_monitored_chats(user_id, chat_id, added_at) "
+            "VALUES (?, ?, ?)",
+            (int(user_id), int(chat_id), iso(now_utc())),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def remove_user_monitored_chat(user_id, chat_id):
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM user_monitored_chats WHERE user_id=? AND chat_id=?",
+            (int(user_id), int(chat_id)),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def get_user_monitored_chats(user_id):
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT m.chat_id, m.title, m.username, m.chat_type, m.last_seen_at
+            FROM user_monitored_chats um
+            JOIN monitored_chats m ON m.chat_id = um.chat_id
+            WHERE um.user_id=?
+            ORDER BY m.chat_type, m.title COLLATE NOCASE
+        """, (int(user_id),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_user_monitored_chat_ids(user_id):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM user_monitored_chats WHERE user_id=?",
+            (int(user_id),),
+        ).fetchall()
+    return {int(row["chat_id"]) for row in rows}
+
+
+def get_chat_monitored_users(chat_id):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM user_monitored_chats WHERE chat_id=? ORDER BY user_id",
+            (int(chat_id),),
+        ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+def add_monitor_for_user(user_id, chat_id):
+    return add_user_monitored_chat(user_id, chat_id)
+
+
+def remove_monitor_for_user(user_id, chat_id):
+    return remove_user_monitored_chat(user_id, chat_id)
+
+
+def revoke_user_access(user_id):
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE users SET access_expires_at=NULL, monitoring_enabled=0, paused_at=NULL WHERE user_id=?",
+            (int(user_id),),
+        )
+        conn.commit()
+        return cur.rowcount > 0
