@@ -288,28 +288,105 @@ async def send_one_alert(bot, user_id, keyword, alert, keyboard):
         print(f"Failed to send alert to {user_id}: {e}")
 
 
-async def send_alerts(event, keyword_users, bot):
-    original_text = event.raw_text or ""
+# In-memory monitor configuration cache.
+# The previous version queried PostgreSQL for every incoming Telegram message,
+# which can create a processing backlog when many groups are active.
+ACTIVE_KEYWORD_USERS = {}
+ADMIN_MONITORED_IDS = set()
+USER_MONITORED_IDS = {}
+CONFIG_REFRESH_SECONDS = 5
 
-    # Never process messages sent by Telegram bots. This is based on
-    # Telegram's actual sender.bot flag, not the sender's username.
-    sender = await event.get_sender()
-    if sender is not None:
-        if getattr(sender, "bot", False):
-            return
-        if BOT_USER_ID is not None and getattr(sender, "id", None) == BOT_USER_ID:
-            return
+
+def normalize_chat_id(chat_id):
+    chat_id = int(chat_id)
+    if chat_id <= -1000000000000:
+        return abs(chat_id) - 1000000000000
+    if chat_id < 0:
+        return abs(chat_id)
+    return chat_id
+
+
+def load_monitor_config_sync():
+    active_users = get_all_active_keyword_users()
+    admin_ids = get_admin_monitored_chat_ids()
+
+    user_source_ids = {}
+    for user_id in active_users:
+        user_source_ids[int(user_id)] = get_user_monitored_chat_ids(user_id)
+
+    return active_users, admin_ids, user_source_ids
+
+
+async def refresh_monitor_config():
+    global ACTIVE_KEYWORD_USERS
+    global ADMIN_MONITORED_IDS
+    global USER_MONITORED_IDS
+
+    while True:
+        try:
+            active_users, admin_ids, user_source_ids = await asyncio.to_thread(
+                load_monitor_config_sync
+            )
+            ACTIVE_KEYWORD_USERS = active_users
+            ADMIN_MONITORED_IDS = admin_ids
+            USER_MONITORED_IDS = user_source_ids
+        except Exception as e:
+            print(f"Config refresh failed: {e}")
+
+        await asyncio.sleep(CONFIG_REFRESH_SECONDS)
+
+
+async def send_alerts(event, bot):
+    original_text = event.raw_text or ""
 
     # Never process outgoing messages from the monitoring account.
     if getattr(event, "out", False):
         return
 
     # LF is required before any keyword can match.
-    # Messages without a standalone LF are ignored.
     if not contains_standalone_lf(original_text):
         return
 
-    # Existing filters are intentionally unchanged.
+    # Cheap source + keyword checks happen before any sender API lookup.
+    event_chat_id = normalize_chat_id(event.chat_id)
+    text = remove_ignored_tags(original_text)
+    text_lower = text.lower()
+
+    alert_jobs = []
+
+    for user_id, keywords in ACTIVE_KEYWORD_USERS.items():
+        user_sources = USER_MONITORED_IDS.get(user_id, set())
+
+        if event_chat_id not in ADMIN_MONITORED_IDS and event_chat_id not in user_sources:
+            continue
+
+        matched_keyword = None
+        for keyword in keywords:
+            if keyword.strip().lower() in text_lower:
+                matched_keyword = keyword
+                break
+
+        if matched_keyword:
+            alert_jobs.append((user_id, matched_keyword))
+
+    # If no active user's keyword matches, stop immediately.
+    if not alert_jobs:
+        return
+
+    # Only matching candidate messages need sender lookups/filtering.
+    sender = getattr(event, "sender", None)
+    if sender is None:
+        try:
+            sender = await event.get_sender()
+        except Exception:
+            sender = None
+
+    if sender is not None:
+        if getattr(sender, "bot", False):
+            return
+        if BOT_USER_ID is not None and getattr(sender, "id", None) == BOT_USER_ID:
+            return
+
     sender_name, _ = get_sender_info(event)
 
     if contains_fb_or_lfb(original_text):
@@ -324,52 +401,24 @@ async def send_alerts(event, keyword_users, bot):
     if sender_should_be_filtered(sender_name):
         return
 
-    text = remove_ignored_tags(original_text)
+    # Send alerts concurrently so one slow Bot API request does not hold up the others.
+    await asyncio.gather(
+        *[
+            _send_candidate_alert(event, bot, user_id, matched_keyword)
+            for user_id, matched_keyword in alert_jobs
+        ]
+    )
 
-    # Source gate: only admin-permanent sources or that user's optional sources
-    # are eligible. Being present in the monitoring account's Telegram dialogs
-    # is NOT enough.
-    # Normalize Telethon marked chat/channel IDs to the positive IDs stored in the database.
-    event_chat_id = int(event.chat_id)
-    if event_chat_id <= -1000000000000:
-        event_chat_id = abs(event_chat_id) - 1000000000000
-    elif event_chat_id < 0:
-        event_chat_id = abs(event_chat_id)
 
-    admin_monitored_ids = get_admin_monitored_chat_ids()
-
-    alert_jobs = []
-
-    for user_id, keywords in keyword_users.items():
-        user_monitored_ids = get_user_monitored_chat_ids(user_id)
-        if event_chat_id not in admin_monitored_ids and event_chat_id not in user_monitored_ids:
-            continue
-        matched_keyword = None
-
-        for keyword in keywords:
-            if keyword.strip().lower() in text.lower():
-                matched_keyword = keyword
-                break
-
-        if not matched_keyword:
-            continue
-
-        alert, keyboard = build_alert(event, matched_keyword)
-
-        # Send to all matching users concurrently instead of waiting
-        # for each Telegram API request one-by-one.
-        alert_jobs.append(
-            send_one_alert(
-                bot,
-                user_id,
-                matched_keyword,
-                alert,
-                keyboard,
-            )
-        )
-
-    if alert_jobs:
-        await asyncio.gather(*alert_jobs)
+async def _send_candidate_alert(event, bot, user_id, matched_keyword):
+    alert, keyboard = build_alert(event, matched_keyword)
+    await send_one_alert(
+        bot,
+        user_id,
+        matched_keyword,
+        alert,
+        keyboard,
+    )
 
 
 async def record_monitored_dialogs():
@@ -418,18 +467,8 @@ BOT = Bot(BOT_TOKEN, request=BOT_REQUEST)
 
 @client.on(events.NewMessage(incoming=True))
 async def new_message(event):
-    print(
-        f"INCOMING MESSAGE -> chat_id={event.chat_id}, "
-        f"sender_id={getattr(event.sender, 'id', None)}"
-    )
+    await send_alerts(event, BOT)
 
-    keyword_users = get_all_active_keyword_users()
-
-    if not keyword_users:
-        print("No active keyword users.")
-        return
-
-    await send_alerts(event, keyword_users, BOT)
 
 async def main():
     init_db()
@@ -449,6 +488,25 @@ async def main():
 
     try:
         await record_monitored_dialogs()
+
+        # Initial database load before processing live messages.
+        global ACTIVE_KEYWORD_USERS
+        global ADMIN_MONITORED_IDS
+        global USER_MONITORED_IDS
+        (
+            ACTIVE_KEYWORD_USERS,
+            ADMIN_MONITORED_IDS,
+            USER_MONITORED_IDS,
+        ) = await asyncio.to_thread(load_monitor_config_sync)
+
+        print(
+            f"Loaded {len(ACTIVE_KEYWORD_USERS)} active keyword users "
+            f"and {len(ADMIN_MONITORED_IDS)} permanent sources."
+        )
+
+        # Refresh keyword/access/source settings without blocking Telegram events.
+        asyncio.create_task(refresh_monitor_config())
+
         await client.run_until_disconnected()
     finally:
         await BOT.shutdown()
