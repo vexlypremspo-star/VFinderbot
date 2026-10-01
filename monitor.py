@@ -8,6 +8,7 @@ from html import escape
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
 
@@ -33,8 +34,18 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Run setup.py first.")
 
 API_ID = int(API_ID)
-SESSION_NAME = "user_monitor_session"
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "").strip()
+
+if TELEGRAM_SESSION:
+    client = TelegramClient(
+        StringSession(TELEGRAM_SESSION),
+        API_ID,
+        API_HASH
+    )
+else:
+    SESSION_NAME = "user_monitor_session"
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 # Telegram Bot API identity. Messages sent by this bot must never be
 # treated as source messages by the monitoring account.
@@ -407,13 +418,18 @@ BOT = Bot(BOT_TOKEN, request=BOT_REQUEST)
 
 @client.on(events.NewMessage(incoming=True))
 async def new_message(event):
+    print(
+        f"INCOMING MESSAGE -> chat_id={event.chat_id}, "
+        f"sender_id={getattr(event.sender, 'id', None)}"
+    )
+
     keyword_users = get_all_active_keyword_users()
 
     if not keyword_users:
+        print("No active keyword users.")
         return
 
     await send_alerts(event, keyword_users, BOT)
-
 
 async def main():
     init_db()
